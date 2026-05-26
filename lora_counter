@@ -1,0 +1,331 @@
+#include <MKRWAN.h>
+#include <FlashStorage_SAMD.h>
+
+#define DEBUG 1
+
+const char* appEui = "XXX";
+const char* appKey = "XXX";
+
+const int sensorPin = 2;
+const int resetPin  = 3;
+
+const unsigned long sendInterval        = 30UL * 60UL * 1000UL;
+const unsigned long debounceDelay       = 50;
+const unsigned long SAVE_INTERVAL       = 15UL * 60UL * 1000UL;
+const uint32_t      SAVE_EVERY_N        = 10;
+const unsigned long JOIN_RETRY_INTERVAL = 10UL * 60UL * 1000UL;
+const int           SETUP_JOIN_ATTEMPTS = 3;
+
+#define WL_SLOTS  32
+#define WL_MAGIC  0xA5A5A5A5UL
+
+LoRaModem modem;
+
+int lastSensorState = HIGH;
+int stableState     = HIGH;
+unsigned long lastDebounceTime = 0;
+
+uint32_t totalCount = 0;
+unsigned long lastSendTime = 0;
+unsigned long lastSaveTime = 0;
+uint32_t lastSavedCount = 0xFFFFFFFFUL;
+
+bool joined = false;
+unsigned long lastJoinAttempt = 0;
+
+struct WearEntry {
+  uint32_t magic;
+  uint32_t sequence;
+  uint32_t count;
+  uint32_t crc32;
+};
+
+struct WearLog {
+  WearEntry e[WL_SLOTS];
+};
+
+FlashStorage(wearStore, WearLog);
+
+uint32_t wlSequence = 0;
+int wlSlot = -1;
+
+#if DEBUG
+  #define DBG(x)    Serial.print(x)
+  #define DBGLN(x)  Serial.println(x)
+#else
+  #define DBG(x)    do {} while(0)
+  #define DBGLN(x)  do {} while(0)
+#endif
+
+static uint32_t crc32_update(uint32_t crc, uint8_t data) {
+  crc ^= data;
+  for (int i = 0; i < 8; i++) {
+    if (crc & 1) crc = (crc >> 1) ^ 0xEDB88320UL;
+    else         crc = (crc >> 1);
+  }
+  return crc;
+}
+
+static uint32_t crc32_bytes(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (size_t i = 0; i < len; i++) {
+    crc = crc32_update(crc, data[i]);
+  }
+  return ~crc;
+}
+
+static uint32_t entryCrc(const WearEntry& en) {
+  uint8_t buf[12];
+  buf[0]  = (uint8_t)(en.magic);
+  buf[1]  = (uint8_t)(en.magic >> 8);
+  buf[2]  = (uint8_t)(en.magic >> 16);
+  buf[3]  = (uint8_t)(en.magic >> 24);
+
+  buf[4]  = (uint8_t)(en.sequence);
+  buf[5]  = (uint8_t)(en.sequence >> 8);
+  buf[6]  = (uint8_t)(en.sequence >> 16);
+  buf[7]  = (uint8_t)(en.sequence >> 24);
+
+  buf[8]  = (uint8_t)(en.count);
+  buf[9]  = (uint8_t)(en.count >> 8);
+  buf[10] = (uint8_t)(en.count >> 16);
+  buf[11] = (uint8_t)(en.count >> 24);
+
+  return crc32_bytes(buf, sizeof(buf));
+}
+
+static bool entryValid(const WearEntry& en) {
+  if (en.magic != WL_MAGIC) return false;
+  return entryCrc(en) == en.crc32;
+}
+
+static bool seqNewer(uint32_t a, uint32_t b) {
+  return (int32_t)(a - b) > 0;
+}
+
+void sendCount(uint32_t count) {
+  uint8_t buf[4] = {
+    (uint8_t)(count >> 24),
+    (uint8_t)(count >> 16),
+    (uint8_t)(count >> 8),
+    (uint8_t)(count)
+  };
+
+  DBG("TX count=");
+  DBGLN(count);
+
+  modem.beginPacket();
+  modem.write(buf, sizeof(buf));
+  int err = modem.endPacket(false);
+
+  if (DEBUG) {
+    if (err > 0) DBGLN("TX ok");
+    else {
+      DBG("TX fail: ");
+      DBGLN(err);
+    }
+  }
+}
+
+void wlLoad() {
+  WearLog log;
+  wearStore.read(log);
+
+  bool found = false;
+  uint32_t bestSeq = 0;
+  uint32_t bestCount = 0;
+  int bestSlot = -1;
+
+  for (int i = 0; i < WL_SLOTS; i++) {
+    const WearEntry& en = log.e[i];
+    if (!entryValid(en)) continue;
+
+    if (!found) {
+      found = true;
+      bestSeq = en.sequence;
+      bestCount = en.count;
+      bestSlot = i;
+    } else if (seqNewer(en.sequence, bestSeq)) {
+      bestSeq = en.sequence;
+      bestCount = en.count;
+      bestSlot = i;
+    }
+  }
+
+  if (found) {
+    wlSequence = bestSeq;
+    wlSlot = bestSlot;
+    totalCount = bestCount;
+
+    DBG("WL load ok: count=");
+    DBG(totalCount);
+    DBG(" seq=");
+    DBG(wlSequence);
+    DBG(" slot=");
+    DBGLN(wlSlot);
+  } else {
+    wlSequence = 0;
+    wlSlot = -1;
+    totalCount = 0;
+    DBGLN("WL load: empty. Starting at 0.");
+  }
+
+  lastSavedCount = totalCount;
+  lastSaveTime = millis();
+}
+
+bool wlSaveNow(const char* reason) {
+  WearLog log;
+  wearStore.read(log);
+
+  int nextSlot = (wlSlot < 0) ? 0 : ((wlSlot + 1) % WL_SLOTS);
+  uint32_t nextSeq = wlSequence + 1;
+
+  WearEntry en;
+  en.magic = WL_MAGIC;
+  en.sequence = nextSeq;
+  en.count = totalCount;
+  en.crc32 = entryCrc(en);
+
+  log.e[nextSlot] = en;
+
+  wearStore.write(log);
+  Serial.flush();
+  delay(50);
+
+  WearLog verifyLog;
+  wearStore.read(verifyLog);
+
+  const WearEntry& v = verifyLog.e[nextSlot];
+  bool ok = entryValid(v) && v.sequence == nextSeq && v.count == totalCount;
+
+  if (ok) {
+    wlSlot = nextSlot;
+    wlSequence = nextSeq;
+    lastSavedCount = totalCount;
+    lastSaveTime = millis();
+
+    DBG("WL save ok (");
+    DBG(reason);
+    DBG("): count=");
+    DBG(totalCount);
+    DBG(" slot=");
+    DBG(wlSlot);
+    DBG(" seq=");
+    DBGLN(wlSequence);
+  } else if (DEBUG) {
+    DBGLN("WL save FAILED (verify mismatch)");
+    DBG("  wrote: slot="); DBG(nextSlot);
+    DBG(" seq="); DBG(nextSeq);
+    DBG(" count="); DBGLN(totalCount);
+
+    DBG("  read : magic=0x"); Serial.print(v.magic, HEX);
+    DBG(" seq="); DBG(v.sequence);
+    DBG(" count="); DBG(v.count);
+    DBG(" crc_ok="); DBGLN(entryValid(v) ? "yes" : "no");
+  }
+
+  Serial.flush();
+  delay(30);
+  return ok;
+}
+
+bool tryJoin() {
+  if (DEBUG) DBGLN("Joining TTN...");
+  if (modem.joinOTAA(appEui, appKey)) {
+    joined = true;
+    if (DEBUG) DBGLN("Join ok");
+    return true;
+  }
+  if (DEBUG) DBGLN("Join failed");
+  return false;
+}
+
+void setup() {
+  pinMode(sensorPin, INPUT_PULLUP);
+  pinMode(resetPin,  INPUT_PULLUP);
+
+  Serial.begin(9600);
+  unsigned long t0 = millis();
+  while (!Serial && millis() - t0 < 2000) {
+    ;
+  }
+
+  DBGLN("BOOT");
+  wlLoad();
+
+  if (!modem.begin(EU868)) {
+    DBGLN("LoRa modem start failed");
+    while (1) {}
+  }
+
+  if (DEBUG) {
+    DBG("DevEUI: ");
+    DBGLN(modem.deviceEUI());
+  }
+
+  for (int i = 0; i < SETUP_JOIN_ATTEMPTS; i++) {
+    if (tryJoin()) break;
+    if (i < SETUP_JOIN_ATTEMPTS - 1) {
+      if (DEBUG) DBGLN("Retrying in 10s...");
+      delay(10000);
+    }
+  }
+  lastJoinAttempt = millis();
+
+  if (joined) {
+    sendCount(totalCount);
+    lastSendTime = millis();
+  } else {
+    if (DEBUG) DBGLN("No join, continuing offline. Will retry in background.");
+    lastSendTime = millis();
+  }
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (!joined && (now - lastJoinAttempt >= JOIN_RETRY_INTERVAL)) {
+    lastJoinAttempt = now;
+    if (tryJoin()) {
+      sendCount(totalCount);
+      lastSendTime = now;
+    }
+  }
+
+  if (digitalRead(resetPin) == LOW) {
+    totalCount = 0;
+    wlSaveNow("reset");
+    if (DEBUG) DBGLN("Reset -> count=0 saved");
+    while (digitalRead(resetPin) == LOW) {}
+    delay(20);
+  }
+
+  int reading = digitalRead(sensorPin);
+  if (reading != lastSensorState) lastDebounceTime = now;
+
+  if (now - lastDebounceTime > debounceDelay) {
+    if (reading != stableState) {
+      stableState = reading;
+
+      if (stableState == LOW) {
+        totalCount++;
+        if (DEBUG) { DBG("Count="); DBGLN(totalCount); }
+
+        if ((totalCount % SAVE_EVERY_N == 0) && (totalCount != lastSavedCount)) {
+          wlSaveNow("everyN");
+        }
+      }
+    }
+  }
+  lastSensorState = reading;
+
+  if (joined && (now - lastSendTime >= sendInterval)) {
+    sendCount(totalCount);
+    lastSendTime = now;
+  }
+
+  if ((now - lastSaveTime >= SAVE_INTERVAL) && (totalCount != lastSavedCount)) {
+    wlSaveNow("timer");
+  }
+}
