@@ -6,7 +6,7 @@
 const char* appEui = "XXX";
 const char* appKey = "XXX";
 
-const int sensorPin = 2;
+const int sensorPin = A2;
 const int resetPin  = 3;
 
 const unsigned long sendInterval        = 30UL * 60UL * 1000UL;
